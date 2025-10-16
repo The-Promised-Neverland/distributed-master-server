@@ -21,12 +21,22 @@ type HostMetrics struct {
 	Uptime      uint64  `json:"uptime"`
 }
 
-// Heartbeat sent by agent
-type Heartbeat struct {
-	AgentID     string       `json:"agent_id"`
-	HostMetrics *HostMetrics `json:"host_metrics"`
-	Timestamp   int64        `json:"timestamp"`
-}
+// Message types sent BY AGENT
+const (
+	AgentMsgHeartbeat           = "agent_metrics"
+	AgentMsgJobStatus           = "agent_job_status"
+	AgentMsgUninstall           = "agent_uninstall"
+	AgentMsgUninstallInitiated  = "agent_uninstall_initiated"
+	AgentMsgUninstallResponding = "agent_uninstall_responding"
+)
+
+// Message types sent BY MASTER
+const (
+	MasterMsgMetricsRequest = "master_metrics_request"
+	MasterMsgTaskAssignment = "master_task_assigned"
+	MasterMsgRestartAgent   = "master_restart"
+	MasterMsgAgentUninstall = "master_uninstall"
+)
 
 // Generic message wrapper
 type Message struct {
@@ -34,8 +44,31 @@ type Message struct {
 	Payload interface{} `json:"payload"`
 }
 
+// Heartbeat sent by agent
+type Metrics struct {
+	AgentID     string       `json:"agent_id"`
+	HostMetrics *HostMetrics `json:"host_metrics"`
+	Timestamp   int64        `json:"timestamp"`
+}
+
+// Job status update from agent
+type JobStatus struct {
+	AgentID string `json:"agent_id"`
+	JobID   string `json:"job_id"`
+	Status  string `json:"status"` // "started", "completed", "failed"
+	Output  string `json:"output,omitempty"`
+}
+
+// Uninstallation reason
+type UninstallReason struct {
+	AgentID   string `json:"agent_id"`
+	Reason    string `json:"reason"` // "master_request", "agent_initiated"
+	Timestamp int64  `json:"timestamp"`
+}
+
 // Agent info stored on server
 type Agent struct {
+	AgentID     string
 	Conn        *websocket.Conn
 	LastSeen    time.Time
 	Status      string // "online" or "offline"
@@ -97,47 +130,103 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		switch baseMsg.Type {
-		case "heartbeat":
-			payloadBytes, _ := json.Marshal(baseMsg.Payload)
-			var hb Heartbeat
-			if err := json.Unmarshal(payloadBytes, &hb); err != nil {
-				log.Println("⚠️ Failed to parse heartbeat:", err)
-				continue
-			}
-			agentID = hb.AgentID
+		case AgentMsgHeartbeat:
+			handleHeartbeat(baseMsg.Payload, &agentID, conn)
 
-			agentsMux.Lock()
-			ag, ok := agents[agentID]
-			if !ok {
-				ag = &Agent{Conn: conn, Status: "online"}
-				agents[agentID] = ag
-				log.Printf("✅ New agent connected: %s", agentID)
-			}
-			ag.Mutex.Lock()
-			ag.Conn = conn
-			ag.LastSeen = time.Now()
-			ag.Status = "online"
-			ag.HostMetrics = hb.HostMetrics
-			ag.Mutex.Unlock()
-			agentsMux.Unlock()
+		case AgentMsgJobStatus:
+			handleJobStatus(baseMsg.Payload)
 
-			if hb.HostMetrics != nil {
-				metricsStr := fmt.Sprintf(
-					"CPU: %s%% | RAM: %s%% | Disk: %s%% | Host: %s | OS: %s | Uptime: %s",
-					formatFloat(hb.HostMetrics.CPUUsage),
-					formatFloat(hb.HostMetrics.MemoryUsage),
-					formatFloat(hb.HostMetrics.DiskUsage),
-					hb.HostMetrics.Hostname,
-					hb.HostMetrics.OS,
-					formatUptime(hb.HostMetrics.Uptime),
-				)
-				log.Printf("✅ Heartbeat from agent %s | %s", agentID, metricsStr)
-			}
+		case AgentMsgUninstall:
+			handleUninstallation(baseMsg.Payload, "legacy")
+
+		case AgentMsgUninstallInitiated:
+			handleUninstallation(baseMsg.Payload, "agent_initiated")
+
+		case AgentMsgUninstallResponding:
+			handleUninstallation(baseMsg.Payload, "master_request")
 
 		default:
 			log.Println("⚠️ Unknown message type:", baseMsg.Type)
 		}
 	}
+}
+
+// Handle heartbeat from agent
+func handleHeartbeat(payload interface{}, agentID *string, conn *websocket.Conn) {
+	payloadBytes, _ := json.Marshal(payload)
+	var metrics Metrics
+	if err := json.Unmarshal(payloadBytes, &metrics); err != nil {
+		log.Println("⚠️ Failed to parse heartbeat:", err)
+		return
+	}
+
+	*agentID = metrics.AgentID
+
+	agentsMux.Lock()
+	ag, ok := agents[metrics.AgentID]
+	if !ok {
+		ag = &Agent{
+			AgentID: metrics.AgentID,
+			Conn:    conn,
+			Status:  "online",
+		}
+		agents[metrics.AgentID] = ag
+		log.Printf("✅ New agent connected: %s", metrics.AgentID)
+	}
+	ag.Mutex.Lock()
+	ag.Conn = conn
+	ag.LastSeen = time.Now()
+	ag.Status = "online"
+	ag.HostMetrics = metrics.HostMetrics
+	ag.Mutex.Unlock()
+	agentsMux.Unlock()
+
+	if metrics.HostMetrics != nil {
+		metricsStr := fmt.Sprintf(
+			"CPU: %s%% | RAM: %s%% | Disk: %s%% | Host: %s | OS: %s | Uptime: %s",
+			formatFloat(metrics.HostMetrics.CPUUsage),
+			formatFloat(metrics.HostMetrics.MemoryUsage),
+			formatFloat(metrics.HostMetrics.DiskUsage),
+			metrics.HostMetrics.Hostname,
+			metrics.HostMetrics.OS,
+			formatUptime(metrics.HostMetrics.Uptime),
+		)
+		log.Printf("✅ Heartbeat from agent %s | %s", metrics.AgentID, metricsStr)
+	}
+}
+
+// Handle job status update from agent
+func handleJobStatus(payload interface{}) {
+	payloadBytes, _ := json.Marshal(payload)
+	var jobStatus JobStatus
+	if err := json.Unmarshal(payloadBytes, &jobStatus); err != nil {
+		log.Println("⚠️ Failed to parse job status:", err)
+		return
+	}
+
+	log.Printf("📊 Job status from agent %s | JobID: %s | Status: %s | Output: %s",
+		jobStatus.AgentID, jobStatus.JobID, jobStatus.Status, jobStatus.Output)
+}
+
+// Handle uninstallation from agent
+func handleUninstallation(payload interface{}, initiator string) {
+	payloadBytes, _ := json.Marshal(payload)
+	var uninstall UninstallReason
+	if err := json.Unmarshal(payloadBytes, &uninstall); err != nil {
+		log.Println("⚠️ Failed to parse uninstall message:", err)
+		return
+	}
+
+	agentsMux.Lock()
+	ag, ok := agents[uninstall.AgentID]
+	if ok {
+		ag.Mutex.Lock()
+		ag.Status = "offline"
+		ag.Mutex.Unlock()
+		log.Printf("💀 Agent %s uninstalled (initiator: %s) at %d",
+			uninstall.AgentID, uninstall.Reason, uninstall.Timestamp)
+	}
+	agentsMux.Unlock()
 }
 
 // --- Monitor agents periodically ---
