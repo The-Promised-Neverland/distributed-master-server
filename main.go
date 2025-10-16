@@ -36,9 +36,11 @@ type Message struct {
 
 // Agent info stored on server
 type Agent struct {
-	Conn     *websocket.Conn
-	LastSeen time.Time
-	Mutex    sync.Mutex
+	Conn        *websocket.Conn
+	LastSeen    time.Time
+	Status      string // "online" or "offline"
+	HostMetrics *HostMetrics
+	Mutex       sync.Mutex
 }
 
 var (
@@ -49,7 +51,7 @@ var (
 
 const heartbeatTimeout = 20 * time.Second
 
-// --- Pretty printing helpers ---
+// --- Helpers ---
 func formatFloat(f float64) string {
 	return fmt.Sprintf("%.2f", f)
 }
@@ -76,9 +78,14 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("⚠️ Connection closed for agent %s: %v", agentID, err)
 			if agentID != "" {
 				agentsMux.Lock()
-				delete(agents, agentID)
+				ag, ok := agents[agentID]
+				if ok {
+					ag.Mutex.Lock()
+					ag.Status = "offline"
+					ag.Mutex.Unlock()
+					log.Printf("⚠️ Agent %s marked offline", agentID)
+				}
 				agentsMux.Unlock()
-				log.Printf("⚠️ Agent %s removed from active list", agentID)
 			}
 			break
 		}
@@ -99,18 +106,23 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			agentID = hb.AgentID
 
-			// Update agent info
 			agentsMux.Lock()
-			agents[agentID] = &Agent{
-				Conn:     conn,
-				LastSeen: time.Now(),
+			ag, ok := agents[agentID]
+			if !ok {
+				ag = &Agent{Conn: conn, Status: "online"}
+				agents[agentID] = ag
+				log.Printf("✅ New agent connected: %s", agentID)
 			}
+			ag.Mutex.Lock()
+			ag.Conn = conn
+			ag.LastSeen = time.Now()
+			ag.Status = "online"
+			ag.HostMetrics = hb.HostMetrics
+			ag.Mutex.Unlock()
 			agentsMux.Unlock()
 
-			// Print heartbeat nicely
-			metricsStr := ""
 			if hb.HostMetrics != nil {
-				metricsStr = fmt.Sprintf(
+				metricsStr := fmt.Sprintf(
 					"CPU: %s%% | RAM: %s%% | Disk: %s%% | Host: %s | OS: %s | Uptime: %s",
 					formatFloat(hb.HostMetrics.CPUUsage),
 					formatFloat(hb.HostMetrics.MemoryUsage),
@@ -119,9 +131,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 					hb.HostMetrics.OS,
 					formatUptime(hb.HostMetrics.Uptime),
 				)
+				log.Printf("✅ Heartbeat from agent %s | %s", agentID, metricsStr)
 			}
-
-			log.Printf("✅ Heartbeat from agent %s | %s", agentID, metricsStr)
 
 		default:
 			log.Println("⚠️ Unknown message type:", baseMsg.Type)
@@ -139,9 +150,9 @@ func monitorAgents() {
 		agentsMux.Lock()
 		for id, ag := range agents {
 			ag.Mutex.Lock()
-			if now.Sub(ag.LastSeen) > heartbeatTimeout {
-				log.Printf("⚠️ Agent %s disconnected (offline for > %v)", id, heartbeatTimeout)
-				delete(agents, id)
+			if ag.Status == "online" && now.Sub(ag.LastSeen) > heartbeatTimeout {
+				ag.Status = "offline"
+				log.Printf("⚠️ Agent %s marked offline due to heartbeat timeout", id)
 			}
 			ag.Mutex.Unlock()
 		}
