@@ -23,11 +23,9 @@ type HostMetrics struct {
 
 // Message types sent BY AGENT
 const (
-	AgentMsgHeartbeat           = "agent_metrics"
-	AgentMsgJobStatus           = "agent_job_status"
-	AgentMsgUninstall           = "agent_uninstall"
-	AgentMsgUninstallInitiated  = "agent_uninstall_initiated"
-	AgentMsgUninstallResponding = "agent_uninstall_responding"
+	AgentMsgHeartbeat = "agent_metrics"
+	AgentMsgJobStatus = "agent_job_status"
+	AgentMsgUninstall = "agent_uninstall"
 )
 
 // Message types sent BY MASTER
@@ -137,13 +135,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			handleJobStatus(baseMsg.Payload)
 
 		case AgentMsgUninstall:
-			handleUninstallation(baseMsg.Payload, "legacy")
-
-		case AgentMsgUninstallInitiated:
-			handleUninstallation(baseMsg.Payload, "agent_initiated")
-
-		case AgentMsgUninstallResponding:
-			handleUninstallation(baseMsg.Payload, "master_request")
+			handleUninstallation(baseMsg.Payload)
 
 		default:
 			log.Println("⚠️ Unknown message type:", baseMsg.Type)
@@ -209,7 +201,7 @@ func handleJobStatus(payload interface{}) {
 }
 
 // Handle uninstallation from agent
-func handleUninstallation(payload interface{}, initiator string) {
+func handleUninstallation(payload interface{}) {
 	payloadBytes, _ := json.Marshal(payload)
 	var uninstall UninstallReason
 	if err := json.Unmarshal(payloadBytes, &uninstall); err != nil {
@@ -223,8 +215,11 @@ func handleUninstallation(payload interface{}, initiator string) {
 		ag.Mutex.Lock()
 		ag.Status = "offline"
 		ag.Mutex.Unlock()
-		log.Printf("💀 Agent %s uninstalled (initiator: %s) at %d",
+		log.Printf("💀 Agent %s uninstalled (reason: %s) at %d",
 			uninstall.AgentID, uninstall.Reason, uninstall.Timestamp)
+	} else {
+		log.Printf("💀 Agent %s uninstalled but was not in registry (reason: %s)",
+			uninstall.AgentID, uninstall.Reason)
 	}
 	agentsMux.Unlock()
 }
