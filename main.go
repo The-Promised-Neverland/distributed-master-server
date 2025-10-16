@@ -11,40 +11,33 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// ---------------------------
-// WebSocket upgrader
-// ---------------------------
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
-}
-
-// ---------------------------
-// Agent structure
-// ---------------------------
 type Agent struct {
-	Conn          *websocket.Conn
-	LastHeartbeat int64
-	Metrics       interface{} // store last metrics
+	Conn         *websocket.Conn
+	LastSeen     time.Time
+	HeartbeatMux sync.Mutex
 }
 
-// Global map to track all connected agents
 var (
-	agents   = make(map[string]*Agent) // agentID -> Agent
-	agentsMu sync.Mutex                // mutex to protect the map
+	upgrader = websocket.Upgrader{
+		CheckOrigin: func(r *http.Request) bool { return true },
+	}
+	agents   = make(map[string]*Agent) // map of agentID -> agent info
+	agentsMu sync.Mutex
 )
 
-// ---------------------------
-// Message structures
-// ---------------------------
-type HeartbeatPayload struct {
-	AgentID string      `json:"agent_id"`
-	Metrics interface{} `json:"host_metrics,omitempty"`
-	Timestamp int64     `json:"timestamp"`
+const heartbeatTimeout = 20 * time.Second // mark agent offline if no heartbeat in this interval
+
+type Heartbeat struct {
+	AgentID string `json:"agent_id"`
+	// HostMetrics can be added if needed
+	Timestamp int64 `json:"timestamp"`
 }
 
-// ---------------------------
-// WebSocket handler
-// ---------------------------
+type Message struct {
+	Type    string      `json:"type"`
+	Payload interface{} `json:"payload"`
+}
+
 func wsHandler(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -59,69 +52,77 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	for {
 		_, msg, err := conn.ReadMessage()
 		if err != nil {
-			log.Println("⚠️ Connection closed for agent:", agentID, err)
+			log.Printf("⚠️ Connection closed for agent %s: %v", agentID, err)
 			if agentID != "" {
 				agentsMu.Lock()
 				delete(agents, agentID)
 				agentsMu.Unlock()
-				log.Println("🛑 Agent removed:", agentID) 
+				log.Printf("⚠️ Agent %s removed from active list", agentID)
 			}
 			break
 		}
 
-		var hb HeartbeatPayload
-		if err := json.Unmarshal(msg, &hb); err != nil {
+		var baseMsg Message
+		if err := json.Unmarshal(msg, &baseMsg); err != nil {
 			log.Println("⚠️ Failed to parse message:", err)
 			continue
 		}
 
-		agentID = hb.AgentID
+		switch baseMsg.Type {
+		case "heartbeat":
+			payloadBytes, _ := json.Marshal(baseMsg.Payload)
+			var hb Heartbeat
+			if err := json.Unmarshal(payloadBytes, &hb); err != nil {
+				log.Println("⚠️ Failed to parse heartbeat:", err)
+				continue
+			}
+			agentID = hb.AgentID
 
-		// Register or update agent
-		agentsMu.Lock()
-		agents[agentID] = &Agent{
-			Conn:          conn,
-			LastHeartbeat: time.Now().Unix(),
-			Metrics:       hb.Metrics,
+			agentsMu.Lock()
+			agents[agentID] = &Agent{
+				Conn:     conn,
+				LastSeen: time.Now(),
+			}
+			agentsMu.Unlock()
+
+			log.Printf("✅ Heartbeat received from agent: %s", agentID)
+
+		default:
+			log.Println("⚠️ Unknown message type:", baseMsg.Type)
 		}
-		agentsMu.Unlock()
-
-		log.Println("✅ Heartbeat received from agent:", agentID)
 	}
 }
 
-// ---------------------------
-// Monitor agents for offline detection
-// ---------------------------
-func MonitorAgents(timeoutSeconds int64) {
-	for {
-		time.Sleep(1 * time.Second)
-		now := time.Now().Unix()
+// Periodically check for offline agents
+func monitorAgents() {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		now := time.Now()
 		agentsMu.Lock()
-		for id, agent := range agents {
-			if now-agent.LastHeartbeat > timeoutSeconds {
-				log.Println("⚠️ Agent offline:", id)
-				agent.Conn.Close()
+		for id, ag := range agents {
+			ag.HeartbeatMux.Lock()
+			if now.Sub(ag.LastSeen) > heartbeatTimeout {
+				log.Printf("⚠️ Agent offline: %s", id)
 				delete(agents, id)
 			}
+			ag.HeartbeatMux.Unlock()
 		}
 		agentsMu.Unlock()
 	}
 }
 
-// ---------------------------
-// Main
-// ---------------------------
 func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
 
-	// Start monitoring agents with 5s timeout
-	go MonitorAgents(5)
-
 	http.HandleFunc("/ws", wsHandler)
+
+	go monitorAgents()
+
 	log.Printf("🌐 Master server listening on :%s/ws\n", port)
 	if err := http.ListenAndServe(":"+port, nil); err != nil {
 		log.Fatal(err)
